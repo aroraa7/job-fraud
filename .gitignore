@@ -1,0 +1,32 @@
+# Credentials and local environments
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+.venv/
+venv/
+envs/
+
+# Data and generated artifacts
+/data/raw/*
+/data/processed/*
+/data/embeddings/*
+/models/*
+/reports/*
+!/data/raw/.gitkeep
+!/data/processed/.gitkeep
+!/data/embeddings/.gitkeep
+!/models/.gitkeep
+!/reports/.gitkeep
+
+# Caches and build outputs
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.pytest_cache/
+.cache/
+*.egg-info/
+build/
+dist/
+.DS_Store
