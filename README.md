@@ -75,7 +75,20 @@ See `notebooks/01_raw_data_audit_example.ipynb` for an example importing the sha
 
 ## Status
 
-Both full embedding matrices are complete and verified: **17,880 postings × 768 dimensions** for BERT and OpenAI. Ordered posting IDs, labels, and text hashes match the input snapshot and each other. Vectors are finite float32 values; saved checksums, BERT model revision, OpenAI dimension settings, and unchanged raw data were verified. All 33 focused embedding source checks passed. A full-data logistic regression baseline has also been fitted for each provider; no splits have been created.
+Both full embedding matrices are complete and verified: **17,880 postings × 768 dimensions** for BERT and OpenAI. Ordered posting IDs, labels, and text hashes match the input snapshot and each other. Vectors are finite float32 values; saved checksums, BERT model revision, OpenAI dimension settings, and unchanged raw data were verified. Full-data and shared 80/20 train/test logistic regression runs are complete. All 34 focused source checks passed.
+
+## Train/test logistic regression
+
+`configs/train_test.json` specifies a randomized, label-stratified 80/20 split with seed 42, shared by both providers. Membership is persisted in local `data/processed/splits/stratified_80_20_seed42.csv` and checked against posting identity and split settings on reuse. Training contains 14,304 postings (693 fraudulent); test contains 3,576 (173 fraudulent). Both classifiers are freshly fitted on training rows only with the original baseline settings: C=1, no class weighting or scaling, threshold=0.5. There is no validation split or tuning.
+
+| Features | Test fraud precision | Test fraud recall | Test fraud F1 | Test average precision |
+| --- | --- | --- | --- | --- |
+| OpenAI | 90.00% | 31.21% | 46.35% | 71.30% |
+| BERT | 89.42% | 53.76% | 67.15% | 75.62% |
+
+Both fits converged and passed save/load probability consistency checks. Local results and predictions are in `reports/train_test/20261012T190232849352Z/`; models are under the corresponding `models/train_test/` directory. Run the shared source with `PYTHONPATH=src mamba run -n job-fraud python -m job_fraud.baseline --config configs/train_test.json`.
+
+Following the user's randomized-split preference, postings were not grouped or deduplicated. There are 88 distinct identical passage hashes shared between training and test; this overlap can make results optimistic for completely new posting text. Source and embedding identities, split checksum, support, confusion matrices, and model settings are recorded in results.json. Future tuning should use validation data or training-only cross-validation, preserving test data from tuning decisions.
 
 ## Full-data logistic regression baseline
 

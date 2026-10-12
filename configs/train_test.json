@@ -1,0 +1,22 @@
+{
+  "snapshot": "data/embeddings/raw_all_fields_yes_no_v1/20261012T155852190778Z",
+  "providers": {
+    "openai": "openai_20261012T174720981598Z",
+    "bert": "bert_20261012T173827006747Z"
+  },
+  "split": {
+    "path": "data/processed/splits/stratified_80_20_seed42.csv",
+    "test_size": 0.2,
+    "random_state": 42,
+    "grouping": "none; randomized posting split requested by user"
+  },
+  "logistic_regression": {
+    "C": 1.0,
+    "solver": "lbfgs",
+    "max_iter": 2000,
+    "tol": 0.0001,
+    "class_weight": null,
+    "random_state": 42
+  },
+  "threshold": 0.5
+}
