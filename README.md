@@ -75,7 +75,18 @@ See `notebooks/01_raw_data_audit_example.ipynb` for an example importing the sha
 
 ## Status
 
-Both full embedding matrices are complete and verified: **17,880 postings × 768 dimensions** for BERT and OpenAI. Ordered posting IDs, labels, and text hashes match the input snapshot and each other. Vectors are finite float32 values; saved checksums, BERT model revision, OpenAI dimension settings, and unchanged raw data were verified. All 33 focused source checks passed. Splits and trained classifiers remain pending.
+Both full embedding matrices are complete and verified: **17,880 postings × 768 dimensions** for BERT and OpenAI. Ordered posting IDs, labels, and text hashes match the input snapshot and each other. Vectors are finite float32 values; saved checksums, BERT model revision, OpenAI dimension settings, and unchanged raw data were verified. All 33 focused embedding source checks passed. A full-data logistic regression baseline has also been fitted for each provider; no splits have been created.
+
+## Full-data logistic regression baseline
+
+At the user's request, this initial baseline fits and scores all 17,880 postings without a train/validation/test split. These are training scores and do not estimate performance on unseen postings. `configs/baseline.json` uses L2 regularization with `C=1`, the `lbfgs` solver, no class weighting, no added feature scaling, and a 0.5 probability threshold for both providers.
+
+| Features | Fraud precision | Fraud recall | Fraud F1 | Average precision |
+| --- | --- | --- | --- | --- |
+| OpenAI | 93.93% | 37.53% | 53.63% | 75.25% |
+| BERT | 91.49% | 55.89% | 69.39% | 82.74% |
+
+Both fits converged, and saved/loaded models reproduced their probabilities exactly. Local outputs are in `reports/baselines/20261012T182334687129Z/` and `models/baselines/20261012T182334687129Z/`. Results include confusion matrices, class support, configuration, source identity, model checksums, and posting-level predictions. Reusable implementation is in `src/job_fraud/baseline.py`; run it with `PYTHONPATH=src mamba run -n job-fraud python -m job_fraud.baseline`. Each run writes a new local output directory. Generated artifacts are excluded from Git.
 
 Active output directories are listed in local `reports/embedding_checks/20261012/verified_embeddings.json`; the findings are in `summary.md` beside it. The earlier 1,536-dimension OpenAI matrix remains a historical artifact. The new 768-dimension run cost is estimated at $0.21459168, within its additional $0.22 approval. Cumulative estimated OpenAI spending is $0.45744418, including historical runs. No new GitHub push was performed.
 
