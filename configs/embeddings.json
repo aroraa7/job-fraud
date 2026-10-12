@@ -1,0 +1,20 @@
+{
+  "input_version": "raw_all_fields_yes_no_v1",
+  "bert": {
+    "model": "google-bert/bert-base-uncased",
+    "revision": "main",
+    "batch_size": 8,
+    "max_sequence_length": 512,
+    "pooling": "mean_content_tokens",
+    "long_text": "nonoverlapping_chunks_token_weighted_mean"
+  },
+  "openai": {
+    "model": "text-embedding-3-small",
+    "encoding": "cl100k_base",
+    "batch_size": 64,
+    "max_chunk_tokens": 8191,
+    "max_request_tokens": 200000,
+    "long_text": "nonoverlapping_chunks_token_weighted_mean"
+  },
+  "normalize_vectors": false
+}

@@ -11,6 +11,7 @@ Read README.md for project scope and layout.
 - Use identical posting text and persisted split membership for the four experiments. Keep duplicate and related postings in the same split.
 - Fit learned preprocessing and calculate class weights on training data only. Tune hyperparameters and thresholds on validation data; reserve test data for final evaluation.
 - Save embeddings with ordered posting IDs, source/text identity, model/tokenizer identity, and generation settings. Verify alignment before training.
+- For the current embedding stage, retain every raw row and render all 16 posting-information fields. Keep job_id and fraudulent out of embedding text. Render the three binary posting fields as Yes/No in the passage, preserving original CSV values. Do not clean, deduplicate, split, or add vector normalization during this stage.
 - Report fraud precision, recall, F1, average precision, confusion matrices, and class support, with configuration and split identity.
 - Save classifiers with input construction, embedding settings, label mapping, and threshold. Verify save/load prediction consistency.
 - Keep credentials out of source and outputs. Use environment variables. Obtain permission before model downloads or paid API execution.
