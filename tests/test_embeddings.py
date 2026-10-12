@@ -9,7 +9,7 @@ import pytest
 
 from job_fraud.data import EXPECTED_COLUMNS
 from job_fraud.embedding_inputs import INPUT_FIELDS, load_inputs, posting_text, prepare_inputs
-from job_fraud.embeddings import generate_openai, ordered_openai_vectors, save_embeddings, token_chunks, weighted_mean
+from job_fraud.embeddings import bert_chunk_record, generate_openai, load_openai_key, ordered_openai_vectors, save_embeddings, token_chunks, weighted_mean
 
 
 def record():
@@ -94,6 +94,17 @@ def test_weighted_chunk_average_is_not_renormalized():
         weighted_mean([[np.nan, 0]], [1])
 
 
+def test_bert_chunk_preserves_content_and_masks_only_added_boundaries():
+    tokenizer = SimpleNamespace(cls_token_id=101, sep_token_id=102,
+                                num_special_tokens_to_add=lambda pair: 2)
+    # A token with the same ID as a boundary can occur in raw content.
+    record = bert_chunk_record([22, 102, 33], tokenizer)
+    assert record["input_ids"] == [101, 22, 102, 33, 102]
+    assert record["special_tokens_mask"] == [1, 0, 0, 0, 1]
+    assert record["attention_mask"] == [1] * 5
+    assert record["token_type_ids"] == [0] * 5
+
+
 def test_response_indices_restore_order_and_reject_missing_rows():
     response = SimpleNamespace(data=[SimpleNamespace(index=1, embedding=[2, 3]),
                                      SimpleNamespace(index=0, embedding=[0, 1])])
@@ -105,6 +116,18 @@ def test_response_indices_restore_order_and_reject_missing_rows():
 def test_api_token_cap_checked_before_import_or_request():
     with pytest.raises(ValueError, match="token cap"):
         generate_openai([[[1, 2, 3]]], {}, max_api_tokens=2)
+
+
+def test_local_key_loader_respects_existing_environment_and_does_not_execute(tmp_path, monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    (tmp_path / ".env").write_text('OTHER=$(touch unsafe)\nOPENAI_API_KEY="fixture-key"\n')
+    load_openai_key(tmp_path)
+    import os
+    assert os.environ["OPENAI_API_KEY"] == "fixture-key"
+    assert not (tmp_path / "unsafe").exists()
+    monkeypatch.setenv("OPENAI_API_KEY", "existing-key")
+    load_openai_key(tmp_path)
+    assert os.environ["OPENAI_API_KEY"] == "existing-key"
 
 
 def test_embedding_save_roundtrip_retains_ids_labels_and_vectors(tmp_path):

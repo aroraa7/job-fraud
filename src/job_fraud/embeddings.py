@@ -19,6 +19,24 @@ from job_fraud.audit import file_sha256
 from job_fraud.embedding_inputs import INPUT_VERSION, load_inputs, prepare_inputs
 
 
+def load_openai_key(root: Path) -> None:
+    """Read only OPENAI_API_KEY from local .env; never execute file contents."""
+    if os.environ.get("OPENAI_API_KEY"):
+        return
+    path = root / ".env"
+    if not path.is_file():
+        return
+    for line in path.read_text(encoding="utf-8").splitlines():
+        name, separator, value = line.strip().partition("=")
+        if separator and name.strip() == "OPENAI_API_KEY":
+            value = value.strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                value = value[1:-1]
+            if value:
+                os.environ["OPENAI_API_KEY"] = value
+            return
+
+
 def token_chunks(tokens: list[int], size: int) -> list[list[int]]:
     if size <= 0 or not tokens:
         raise ValueError("Chunk size must be positive and token input nonempty.")
@@ -74,7 +92,7 @@ def generate_openai(rows: list, settings: dict, max_api_tokens: int) -> tuple[np
     if max_api_tokens < tokens:
         raise ValueError(f"Run requires {tokens} input tokens, exceeding the authorized token cap.")
     if not os.environ.get("OPENAI_API_KEY"):
-        raise ValueError("Set OPENAI_API_KEY in the environment; never put it in project files.")
+        raise ValueError("Set OPENAI_API_KEY in the environment or ignored .env file.")
     from openai import OpenAI
     # No automatic retries: a failure must be reviewed before another paid call.
     client = OpenAI(max_retries=0, timeout=120)
@@ -115,12 +133,20 @@ def generate_openai(rows: list, settings: dict, max_api_tokens: int) -> tuple[np
     }
 
 
+def bert_chunk_record(chunk: list[int], tokenizer) -> dict:
+    """Wrap content IDs with BERT's CLS/SEP tokens without retokenizing."""
+    if tokenizer.cls_token_id is None or tokenizer.sep_token_id is None or tokenizer.num_special_tokens_to_add(pair=False) != 2:
+        raise ValueError("Expected BERT's two single-sequence boundary tokens.")
+    return {"input_ids": [tokenizer.cls_token_id, *chunk, tokenizer.sep_token_id],
+            "token_type_ids": [0] * (len(chunk) + 2),
+            "attention_mask": [1] * (len(chunk) + 2),
+            "special_tokens_mask": [1, *([0] * len(chunk)), 1]}
+
+
 def generate_bert(texts: list[str], settings: dict, allow_download: bool = False) -> tuple[np.ndarray, dict]:
     import torch
     from transformers import AutoModel, AutoTokenizer
     kwargs = {"revision": settings["revision"], "local_files_only": not allow_download}
-    # The slow BERT tokenizer supports preparing already-tokenized chunks with
-    # special-token masks; fast-tokenizer prepare_for_model differs here.
     tokenizer = AutoTokenizer.from_pretrained(settings["model"], use_fast=False, **kwargs)
     model = AutoModel.from_pretrained(settings["model"], **kwargs)
     if settings["max_sequence_length"] > model.config.max_position_embeddings:
@@ -134,15 +160,14 @@ def generate_bert(texts: list[str], settings: dict, allow_download: bool = False
     chunk_counts = []
     content_tokens = 0
     for row_index, text in enumerate(texts):
-        tokens = tokenizer.encode(text, add_special_tokens=False, truncation=False)
+        tokens = tokenizer.encode(text, add_special_tokens=False, truncation=False, verbose=False)
         chunks = token_chunks(tokens, size)
         content_tokens += len(tokens)
         chunk_counts.append(len(chunks))
         vectors = []
         for start in range(0, len(chunks), settings["batch_size"]):
             batch = chunks[start:start + settings["batch_size"]]
-            records = [tokenizer.prepare_for_model(chunk, add_special_tokens=True,
-                        return_special_tokens_mask=True, truncation=False) for chunk in batch]
+            records = [bert_chunk_record(chunk, tokenizer) for chunk in batch]
             encoded = tokenizer.pad(records, padding=True, return_tensors="pt")
             special = encoded.pop("special_tokens_mask").to(device)
             encoded = {name: value.to(device) for name, value in encoded.items()}
@@ -154,7 +179,7 @@ def generate_bert(texts: list[str], settings: dict, allow_download: bool = False
         all_vectors.append(weighted_mean(vectors, [len(chunk) for chunk in chunks]))
         if (row_index + 1) % 100 == 0 or row_index + 1 == len(texts):
             print(f"BERT postings completed: {row_index + 1}/{len(texts)}", flush=True)
-    return np.stack(all_vectors), {"device": device, "resolved_model_revision": getattr(model.config, "_commit_hash", None),
+    return np.stack(all_vectors), {"device": device, "resolved_model_revision": getattr(model.config, "_commit_hash", None) or settings["revision"],
                                   "tokenizer_class": type(tokenizer).__name__,
                                   "content_tokens": content_tokens, "chunk_counts": chunk_counts,
                                   "versions": {name: version(name) for name in ("torch", "transformers")}}
@@ -220,6 +245,7 @@ def main() -> None:
             return
         if args.max_api_tokens is None or args.max_api_tokens <= 0:
             parser.error("OpenAI execution requires an approved positive --max-api-tokens cap")
+        load_openai_key(root)
         values, metadata = generate_openai(rows, config["openai"], args.max_api_tokens)
     else:
         values, metadata = generate_bert(texts, config["bert"], args.allow_model_download)
