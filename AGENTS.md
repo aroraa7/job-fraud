@@ -15,5 +15,6 @@ Read README.md for project scope and layout.
 - Report fraud precision, recall, F1, average precision, confusion matrices, and class support, with configuration and split identity.
 - Save classifiers with input construction, embedding settings, label mapping, and threshold. Verify save/load prediction consistency.
 - Keep credentials out of source and outputs. Use environment variables. Obtain permission before model downloads or paid API execution.
+- Run long computations as background jobs and return control to the user with a brief status. Keep logs and saved outputs so progress and completion can be checked without holding the conversation open.
 - Before Git tracking, exclude credentials, datasets, embeddings, checkpoints, caches, and local environments. Stage files selectively.
 - Do not copy historical experiments into this fresh project unless requested. Explain changes, checks, and remaining limitations.

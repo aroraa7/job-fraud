@@ -10,8 +10,10 @@
   },
   "openai": {
     "model": "text-embedding-3-small",
+    "dimensions": 768,
     "encoding": "cl100k_base",
     "batch_size": 64,
+    "tokens_per_minute": 900000,
     "max_chunk_tokens": 8191,
     "max_request_tokens": 200000,
     "long_text": "nonoverlapping_chunks_token_weighted_mean"

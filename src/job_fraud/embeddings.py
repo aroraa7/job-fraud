@@ -8,10 +8,12 @@ separate user approval; CLI flags are safeguards, not substitutes for approval.
 import argparse
 from datetime import datetime, timezone
 from importlib.metadata import version
+import hashlib
 import json
 import os
 from pathlib import Path
 import platform
+import time
 
 import numpy as np
 
@@ -75,6 +77,11 @@ def _check_config(config: dict) -> None:
         raise ValueError("BERT requires content-token mean pooling and a sequence length of 3–512.")
     if not 1 <= config["openai"]["max_chunk_tokens"] <= 8191 or not 1 <= config["openai"]["max_request_tokens"] <= 300000:
         raise ValueError("OpenAI token limits exceed the supported request bounds.")
+    if config["openai"].get("tokens_per_minute", 900000) <= 0:
+        raise ValueError("OpenAI request pacing must be positive.")
+    dimensions = config["openai"].get("dimensions")
+    if dimensions is not None and (type(dimensions) is not int or not 1 <= dimensions <= 1536):
+        raise ValueError("OpenAI dimensions must be an integer from 1 to 1536 for text-embedding-3-small.")
 
 
 def openai_plan(texts: list[str], settings: dict) -> tuple[list, dict]:
@@ -87,20 +94,28 @@ def openai_plan(texts: list[str], settings: dict) -> tuple[list, dict]:
                   "tokenizer": settings["encoding"]}
 
 
-def generate_openai(rows: list, settings: dict, max_api_tokens: int) -> tuple[np.ndarray, dict]:
+def generate_openai(rows: list, settings: dict, max_api_tokens: int, checkpoint_dir: Path | None = None) -> tuple[np.ndarray, dict]:
     tokens = sum(len(chunk) for chunks in rows for chunk in chunks)
     if max_api_tokens < tokens:
         raise ValueError(f"Run requires {tokens} input tokens, exceeding the authorized token cap.")
     if not os.environ.get("OPENAI_API_KEY"):
         raise ValueError("Set OPENAI_API_KEY in the environment or ignored .env file.")
-    from openai import OpenAI
-    # No automatic retries: a failure must be reviewed before another paid call.
-    client = OpenAI(max_retries=0, timeout=120)
+    from openai import OpenAI, RateLimitError
+    # SDK retries stay off: only explicit temporary rate-limit rejections retry.
     flat = [(row, chunk) for row, chunks in enumerate(rows) for chunk in chunks]
     vectors_by_row = [[] for _ in rows]
     weights_by_row = [[] for _ in rows]
     billed_tokens = 0
     response_models = set()
+    next_request_at = 0.0
+    if checkpoint_dir is not None:
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        identity = hashlib.sha256(json.dumps({"rows": rows, "settings": settings}, sort_keys=True).encode()).hexdigest()
+        identity_file = checkpoint_dir / "identity.txt"
+        if identity_file.exists() and identity_file.read_text().strip() != identity:
+            raise ValueError("Checkpoint input or configuration identity does not match.")
+        identity_file.write_text(identity + "\n")
+    client = OpenAI(max_retries=0, timeout=120)
     try:
         start = 0
         while start < len(flat):
@@ -115,10 +130,48 @@ def generate_openai(rows: list, settings: dict, max_api_tokens: int) -> tuple[np
             if end == start:
                 raise ValueError("A chunk exceeds the per-request token budget.")
             batch = flat[start:end]
-            response = client.embeddings.create(model=settings["model"], input=[chunk for _, chunk in batch], encoding_format="float")
-            values = ordered_openai_vectors(response, len(batch))
-            billed_tokens += response.usage.total_tokens
-            response_models.add(response.model)
+            checkpoint = None if checkpoint_dir is None else checkpoint_dir / f"batch_{start:08d}_{end:08d}.npz"
+            if checkpoint is not None and checkpoint.exists():
+                with np.load(checkpoint, allow_pickle=False) as saved:
+                    values = saved["vectors"]
+                    usage = int(saved["usage"])
+                    model_name = str(saved["model"])
+                if values.ndim != 2 or len(values) != len(batch) or not np.isfinite(values).all():
+                    raise ValueError("Invalid checkpoint vectors.")
+            else:
+                time.sleep(max(0.0, next_request_at - time.monotonic()))
+                for attempt in range(6):
+                    try:
+                        dimension_args = {} if "dimensions" not in settings else {"dimensions": settings["dimensions"]}
+                        response = client.embeddings.create(model=settings["model"], input=[chunk for _, chunk in batch], encoding_format="float", **dimension_args)
+                        break
+                    except RateLimitError as error:
+                        if error.code not in ("rate_limit_exceeded", "slow_down") or attempt == 5:
+                            raise
+                        delay = min(60.0, 2 ** (attempt + 1))
+                        try:
+                            delay = max(delay, float(error.response.headers.get("retry-after", "0")))
+                        except ValueError:
+                            pass
+                        if delay > 60:
+                            raise
+                        print(f"Temporary API rate limit; waiting {delay:.0f}s before retrying rejected batch.", flush=True)
+                        time.sleep(delay)
+                values = ordered_openai_vectors(response, len(batch))
+                if "dimensions" in settings and values.shape[1] != settings["dimensions"]:
+                    raise ValueError("OpenAI returned a different dimension count than requested.")
+                usage = response.usage.total_tokens
+                model_name = response.model
+                next_request_at = time.monotonic() + 60 * request_tokens / settings.get("tokens_per_minute", 900000)
+                if checkpoint is not None:
+                    temporary = checkpoint.with_suffix(".tmp")
+                    with temporary.open("wb") as saved:
+                        np.savez(saved, vectors=values, usage=usage, model=model_name)
+                    temporary.replace(checkpoint)
+            billed_tokens += usage
+            if "dimensions" in settings and values.shape[1] != settings["dimensions"]:
+                raise ValueError("Checkpoint dimensions do not match the requested dimensions.")
+            response_models.add(model_name)
             for (row, chunk), vector in zip(batch, values, strict=True):
                 vectors_by_row[row].append(vector)
                 weights_by_row[row].append(len(chunk))
@@ -156,30 +209,41 @@ def generate_bert(texts: list[str], settings: dict, allow_download: bool = False
     device = "mps" if torch.backends.mps.is_available() else "cpu"
     model.to(device)
     size = settings["max_sequence_length"] - tokenizer.num_special_tokens_to_add(pair=False)
-    all_vectors = []
+    sums = np.zeros((len(texts), model.config.hidden_size), dtype=np.float64)
+    weights = np.zeros(len(texts), dtype=np.int64)
     chunk_counts = []
     content_tokens = 0
+    pending = []
+    def flush_batch():
+        records = [bert_chunk_record(chunk, tokenizer) for _, chunk in pending]
+        encoded = tokenizer.pad(records, padding=True, return_tensors="pt")
+        special = encoded.pop("special_tokens_mask").to(device)
+        encoded = {name: value.to(device) for name, value in encoded.items()}
+        with torch.inference_mode():
+            hidden = model(**encoded).last_hidden_state
+            mask = (encoded["attention_mask"] * (1 - special)).unsqueeze(-1)
+            pooled = (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
+        for (row, chunk), vector in zip(pending, pooled.cpu().numpy(), strict=True):
+            sums[row] += vector.astype(np.float64) * len(chunk)
+            weights[row] += len(chunk)
+        pending.clear()
     for row_index, text in enumerate(texts):
         tokens = tokenizer.encode(text, add_special_tokens=False, truncation=False, verbose=False)
         chunks = token_chunks(tokens, size)
         content_tokens += len(tokens)
         chunk_counts.append(len(chunks))
-        vectors = []
-        for start in range(0, len(chunks), settings["batch_size"]):
-            batch = chunks[start:start + settings["batch_size"]]
-            records = [bert_chunk_record(chunk, tokenizer) for chunk in batch]
-            encoded = tokenizer.pad(records, padding=True, return_tensors="pt")
-            special = encoded.pop("special_tokens_mask").to(device)
-            encoded = {name: value.to(device) for name, value in encoded.items()}
-            with torch.inference_mode():
-                hidden = model(**encoded).last_hidden_state
-                mask = (encoded["attention_mask"] * (1 - special)).unsqueeze(-1)
-                pooled = (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
-            vectors.extend(pooled.cpu().numpy())
-        all_vectors.append(weighted_mean(vectors, [len(chunk) for chunk in chunks]))
+        for chunk in chunks:
+            pending.append((row_index, chunk))
+            if len(pending) == settings["batch_size"]:
+                flush_batch()
         if (row_index + 1) % 100 == 0 or row_index + 1 == len(texts):
+            if pending:
+                flush_batch()
             print(f"BERT postings completed: {row_index + 1}/{len(texts)}", flush=True)
-    return np.stack(all_vectors), {"device": device, "resolved_model_revision": getattr(model.config, "_commit_hash", None) or settings["revision"],
+    if (weights <= 0).any() or int(weights.sum()) != content_tokens:
+        raise ValueError("BERT chunk pooling lost content or posting alignment.")
+    return (sums / weights[:, None]).astype(np.float32), {"device": device, "resolved_model_revision": getattr(model.config, "_commit_hash", None) or settings["revision"],
+                                  "batching": "content chunks across postings",
                                   "tokenizer_class": type(tokenizer).__name__,
                                   "content_tokens": content_tokens, "chunk_counts": chunk_counts,
                                   "versions": {name: version(name) for name in ("torch", "transformers")}}
@@ -246,7 +310,8 @@ def main() -> None:
         if args.max_api_tokens is None or args.max_api_tokens <= 0:
             parser.error("OpenAI execution requires an approved positive --max-api-tokens cap")
         load_openai_key(root)
-        values, metadata = generate_openai(rows, config["openai"], args.max_api_tokens)
+        checkpoint_name = f"rows_{len(frame)}_dimensions_{config['openai'].get('dimensions', 'default')}"
+        values, metadata = generate_openai(rows, config["openai"], args.max_api_tokens, folder / "openai_checkpoints" / checkpoint_name)
     else:
         values, metadata = generate_bert(texts, config["bert"], args.allow_model_download)
     metadata["row_selection"] = "all" if args.limit is None else f"first {len(frame)} rows"

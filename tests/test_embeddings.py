@@ -130,6 +130,97 @@ def test_local_key_loader_respects_existing_environment_and_does_not_execute(tmp
     assert os.environ["OPENAI_API_KEY"] == "existing-key"
 
 
+def test_openai_resume_reuses_completed_batches_and_rejects_changed_identity(tmp_path, monkeypatch):
+    import openai
+    import job_fraud.embeddings as workflow
+    monkeypatch.setenv("OPENAI_API_KEY", "fixture-key")
+    monkeypatch.setattr(workflow.time, "sleep", lambda seconds: None)
+    calls = []
+    def create(**kwargs):
+        assert kwargs["dimensions"] == 2
+        calls.append(kwargs["input"])
+        if len(calls) == 2:
+            raise RuntimeError("simulated interruption")
+        token = kwargs["input"][0][0]
+        return SimpleNamespace(data=[SimpleNamespace(index=0, embedding=[token, 0])],
+                               usage=SimpleNamespace(total_tokens=1), model="fixture")
+    monkeypatch.setattr(openai, "OpenAI", lambda **kwargs: SimpleNamespace(
+        embeddings=SimpleNamespace(create=create), close=lambda: None))
+    settings = {"model": "fixture", "encoding": "fixture", "batch_size": 1, "max_request_tokens": 2, "dimensions": 2}
+    rows = [[[1]], [[2]]]
+    checkpoint = tmp_path / "checkpoints"
+    with pytest.raises(RuntimeError, match="interruption"):
+        generate_openai(rows, settings, 2, checkpoint)
+    values, metadata = generate_openai(rows, settings, 2, checkpoint)
+    np.testing.assert_array_equal(values, [[1, 0], [2, 0]])
+    assert calls == [[[1]], [[2]], [[2]]]
+    assert metadata["usage_total_tokens"] == 2
+    with pytest.raises(ValueError, match="identity"):
+        generate_openai([[[3]], [[2]]], settings, 2, checkpoint)
+
+
+def test_temporary_rate_limit_waits_but_billing_error_does_not_retry(monkeypatch):
+    import httpx
+    import openai
+    import job_fraud.embeddings as workflow
+    monkeypatch.setenv("OPENAI_API_KEY", "fixture-key")
+    waits, calls = [], []
+    monkeypatch.setattr(workflow.time, "sleep", waits.append)
+    response = httpx.Response(429, headers={"retry-after": "7"}, request=httpx.Request("POST", "https://example.com"))
+    def create(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            raise openai.RateLimitError("fixture", response=response, body={"code": "rate_limit_exceeded"})
+        return SimpleNamespace(data=[SimpleNamespace(index=0, embedding=[1, 0])],
+                               usage=SimpleNamespace(total_tokens=1), model="fixture")
+    client = SimpleNamespace(embeddings=SimpleNamespace(create=create), close=lambda: None)
+    monkeypatch.setattr(openai, "OpenAI", lambda **kwargs: client)
+    settings = {"model": "fixture", "encoding": "fixture", "batch_size": 1, "max_request_tokens": 2}
+    generate_openai([[[1]]], settings, 1)
+    assert len(calls) == 2 and 7 in waits
+    def billing_error(**kwargs):
+        calls.append(kwargs)
+        raise openai.RateLimitError("fixture", response=response, body={"code": "insufficient_quota"})
+    client.embeddings.create = billing_error
+    with pytest.raises(openai.RateLimitError):
+        generate_openai([[[1]]], settings, 1)
+    assert len(calls) == 3
+
+
+def test_bert_batches_across_postings_without_mixing_pooling(monkeypatch):
+    import torch
+    from transformers import AutoModel, AutoTokenizer
+    from job_fraud.embeddings import generate_bert
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: False)
+    calls = []
+    class Model:
+        config = SimpleNamespace(hidden_size=2, max_position_embeddings=512, _commit_hash="fixture")
+        def eval(self): return self
+        def requires_grad_(self, enabled):
+            assert enabled is False
+            return self
+        def to(self, device): return self
+        def __call__(self, **encoded):
+            assert not torch.is_grad_enabled()
+            calls.append(encoded["input_ids"].shape[0])
+            ids = encoded["input_ids"].float()
+            return SimpleNamespace(last_hidden_state=torch.stack([ids, 2 * ids], dim=-1))
+    def pad(records, **kwargs):
+        size = max(len(row["input_ids"]) for row in records)
+        return {name: torch.tensor([row[name] + [1 if name == "special_tokens_mask" else 0] *
+                                   (size - len(row[name])) for row in records]) for name in records[0]}
+    tokenizer = SimpleNamespace(cls_token_id=101, sep_token_id=102,
+        num_special_tokens_to_add=lambda pair: 2,
+        encode=lambda text, **kwargs: [int(value) for value in text.split(',')], pad=pad)
+    monkeypatch.setattr(AutoTokenizer, "from_pretrained", lambda *args, **kwargs: tokenizer)
+    monkeypatch.setattr(AutoModel, "from_pretrained", lambda *args, **kwargs: Model())
+    values, metadata = generate_bert(["1,2,3,4", "10,20"],
+        {"model": "fixture", "revision": "fixture", "max_sequence_length": 5, "batch_size": 3})
+    np.testing.assert_allclose(values, [[2.5, 5], [15, 30]])
+    assert metadata["chunk_counts"] == [2, 1]
+    assert metadata["content_tokens"] == 6 and calls == [3]
+
+
 def test_embedding_save_roundtrip_retains_ids_labels_and_vectors(tmp_path):
     _, folder = snapshot(tmp_path)
     frame, manifest = load_inputs(folder)
